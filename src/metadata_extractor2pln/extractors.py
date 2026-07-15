@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -24,6 +25,9 @@ class Corpus:
     numeric: dict[str, list[float]]
 
 
+logger = logging.getLogger(__name__)
+
+
 def extract_records(
     *,
     namespace: str,
@@ -32,56 +36,82 @@ def extract_records(
     backend: ModelBackend | None,
 ) -> ExtractResponse:
     corpus = _build_corpus(plan, records)
-    results: list[RecordResult] = []
+    source_ids = [
+        _source_id(record, plan, index) for index, record in enumerate(records)
+    ]
+    properties_by_record: list[list[ExtractedProperty]] = [[] for _ in records]
+    errors_by_record: list[list[str]] = [[] for _ in records]
+    semantic_specs = [
+        spec for spec in plan.properties if spec.extractor == "semantic_text"
+    ]
+    texts = [_record_text(record, plan) for record in records]
     usage = Usage()
+
     for index, record in enumerate(records):
-        source_id = _source_id(record, plan, index)
-        properties: list[ExtractedProperty] = []
-        errors: list[str] = []
-        semantic_specs: list[PropertySpec] = []
         for spec in plan.properties:
             if spec.extractor == "semantic_text":
-                semantic_specs.append(spec)
                 continue
             try:
                 extracted = _extract_deterministic(spec, record, corpus)
                 if extracted is not None:
-                    properties.append(extracted)
+                    properties_by_record[index].append(extracted)
                 elif spec.required:
-                    errors.append(
+                    errors_by_record[index].append(
                         f"required property {spec.name!r} could not be extracted"
                     )
             except ValueError as exc:
-                errors.append(f"{spec.name}: {exc}")
+                errors_by_record[index].append(f"{spec.name}: {exc}")
 
-        if semantic_specs:
-            if backend is None or not backend.ready:
+    if semantic_specs:
+        if backend is None or not backend.ready:
+            for errors in errors_by_record:
                 errors.extend(
                     f"required property {spec.name!r} needs a configured model backend"
                     for spec in semantic_specs
                     if spec.required
                 )
-            else:
-                text = _record_text(record, plan)
-                try:
-                    result, semantic_usage = backend.extract_semantics(
-                        record=record,
-                        text=text,
-                        properties=semantic_specs,
-                    )
-                    usage = Usage(
-                        input_tokens=usage.input_tokens + semantic_usage.input_tokens,
-                        output_tokens=usage.output_tokens
-                        + semantic_usage.output_tokens,
-                    )
+        else:
+            try:
+                batch, usage = backend.extract_semantics(
+                    texts=texts,
+                    properties=semantic_specs,
+                )
+                returned: set[int] = set()
+                for semantic_record in batch.records:
+                    index = semantic_record.record_index
+                    if index >= len(records):
+                        for errors in errors_by_record:
+                            errors.append(
+                                f"model returned out-of-range record_index {index}"
+                            )
+                        continue
+                    if index in returned:
+                        errors_by_record[index].append(
+                            f"model returned duplicate record_index {index}"
+                        )
+                        continue
+                    returned.add(index)
                     extracted, semantic_errors = _validate_semantics(
-                        result.values, semantic_specs, text
+                        semantic_record.values, semantic_specs, texts[index]
                     )
-                    properties.extend(extracted)
-                    errors.extend(semantic_errors)
-                except (BackendUnavailable, RuntimeError, ValueError) as exc:
-                    errors.append(f"semantic extraction failed: {exc}")
+                    properties_by_record[index].extend(extracted)
+                    errors_by_record[index].extend(semantic_errors)
+                for index in set(range(len(records))) - returned:
+                    errors_by_record[index].extend(
+                        f"required property {spec.name!r} was not returned by the model"
+                        for spec in semantic_specs
+                        if spec.required
+                    )
+            except (BackendUnavailable, RuntimeError, ValueError):
+                logger.exception("Semantic batch extraction failed")
+                for errors in errors_by_record:
+                    errors.append(
+                        "semantic extraction failed because the model backend is unavailable"
+                    )
 
+    results: list[RecordResult] = []
+    for index, source_id in enumerate(source_ids):
+        properties = properties_by_record[index]
         facts = [
             compile_fact(namespace=namespace, entity_id=source_id, extracted=item)
             for item in properties
@@ -95,7 +125,7 @@ def extract_records(
                 entity_id=f"{namespace}_{source_id}",
                 properties=properties,
                 facts=facts,
-                errors=errors,
+                errors=errors_by_record[index],
             )
         )
     return ExtractResponse(
@@ -170,24 +200,14 @@ def _extract_deterministic(
                 detail = f"estimated {minutes} minute reading time from {words} words"
             return _property(spec, _canonical_allowed(spec, value), 1.0, 0.98, detail)
         if spec.metric == "engagement":
-            numbers = [coerce_float(value) for value in values]
-            score = sum(value for value in numbers if value is not None)
-            if not any(value is not None for value in numbers):
+            result = _engagement(record, spec.field_paths)
+            if result is None:
                 return None
-            population = corpus.numeric.get(spec.name, [])
-            percentile = _percentile(score, population)
-            value = (
-                "low"
-                if percentile < 1 / 3
-                else "medium"
-                if percentile < 2 / 3
-                else "high"
-            )
-            detail = f"relative rank of combined engagement score {score:g}"
+            value, strength, detail = result
             return _property(
                 spec,
                 _canonical_allowed(spec, value),
-                0.15 + 0.8 * percentile,
+                strength,
                 0.9,
                 detail,
             )
@@ -204,32 +224,44 @@ def _validate_semantics(
     for item in values:
         spec = by_name.get(item.property_name)
         if spec is None:
-            errors.append(f"model returned unrequested property {item.property_name!r}")
+            logger.warning(
+                "Ignoring unrequested semantic property %r", item.property_name
+            )
             continue
         if item.property_name in seen:
-            errors.append(f"model returned duplicate property {item.property_name!r}")
+            logger.warning(
+                "Ignoring duplicate semantic property %r", item.property_name
+            )
             continue
         seen.add(item.property_name)
         try:
             value = _canonical_allowed(spec, item.value)
         except ValueError as exc:
-            errors.append(f"{spec.name}: {exc}")
+            if spec.required:
+                errors.append(f"{spec.name}: {exc}")
+            else:
+                logger.warning(
+                    "Ignoring optional semantic value for %s: %s", spec.name, exc
+                )
             continue
         quote = item.evidence_quote
+        confidence = item.confidence
+        detail = "model classification constrained by the extraction plan"
         if quote and quote not in text:
-            errors.append(
-                f"{spec.name}: discarded an evidence quote not found in source text"
-            )
             quote = None
+            confidence = min(confidence, 0.6)
+            detail = (
+                "model classification without a verified source quote"
+            )
         extracted.append(
             ExtractedProperty(
                 name=spec.name,
                 value=value,
                 strength=item.strength,
-                confidence=item.confidence,
+                confidence=confidence,
                 evidence=Evidence(
                     method="semantic_text",
-                    detail="model classification constrained by the extraction plan",
+                    detail=detail,
                     quote=quote,
                 ),
             )
@@ -252,15 +284,6 @@ def _build_corpus(plan: ExtractionPlan, records: Sequence[dict[str, Any]]) -> Co
                 for path in spec.field_paths
                 if (number := coerce_float(get_path(record, path))) is not None
             ]
-        elif spec.extractor == "calculated_metric" and spec.metric == "engagement":
-            scores = []
-            for record in records:
-                values = [
-                    coerce_float(get_path(record, path)) for path in spec.field_paths
-                ]
-                if any(value is not None for value in values):
-                    scores.append(sum(value for value in values if value is not None))
-            numeric[spec.name] = scores
     return Corpus(numeric=numeric)
 
 
@@ -295,6 +318,59 @@ def _percentile(value: float, population: Sequence[float]) -> float:
     below = sum(item < value for item in population)
     equal = sum(item == value for item in population)
     return (below + 0.5 * equal) / len(population)
+
+
+def _engagement(
+    record: dict[str, Any], field_paths: Sequence[str]
+) -> tuple[str, float, str] | None:
+    interactions = 0.0
+    views: float | None = None
+    found = False
+    weights = {"comment": 2.0, "share": 3.0}
+    for path in field_paths:
+        number = coerce_float(get_path(record, path))
+        if number is None:
+            continue
+        found = True
+        lowered = path.lower()
+        if "view" in lowered or "impression" in lowered:
+            views = max(0.0, number) if views is None else views + max(0.0, number)
+            continue
+        weight = next(
+            (value for name, value in weights.items() if name in lowered), 1.0
+        )
+        interactions += max(0.0, number) * weight
+    if not found:
+        return None
+
+    if views is not None and views > 0:
+        score = interactions / views
+        if score < 0.01:
+            label = "Low"
+        elif score < 0.03:
+            label = "Medium"
+        elif score < 0.07:
+            label = "High"
+        else:
+            label = "Very_High"
+        strength = min(1.0, score / 0.1)
+        detail = (
+            f"weighted interactions={interactions:g}; views={views:g}; "
+            f"engagement rate={score:.4f}"
+        )
+    else:
+        score = interactions
+        if score < 3:
+            label = "Low"
+        elif score < 10:
+            label = "Medium"
+        elif score < 30:
+            label = "High"
+        else:
+            label = "Very_High"
+        strength = min(1.0, math.log1p(score) / math.log(31))
+        detail = f"weighted interactions={interactions:g}; views unavailable"
+    return label, round(strength, 3), detail
 
 
 def _record_text(record: dict[str, Any], plan: ExtractionPlan) -> str:

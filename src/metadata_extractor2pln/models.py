@@ -63,7 +63,7 @@ class ExtractionPlan(ApiModel):
     text_fields: list[str] = Field(default_factory=list, max_length=32)
     properties: list[PropertySpec] = Field(min_length=1, max_length=100)
     version: int = Field(default=1, ge=1)
-    planner: Literal["heuristic", "gemini", "pinned"] = "heuristic"
+    planner: Literal["heuristic", "gemini", "asi", "pinned"] = "heuristic"
     fingerprint: str = Field(default="", pattern=r"^$|^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
@@ -93,6 +93,15 @@ class SemanticResult(ApiModel):
     values: list[SemanticValue] = Field(default_factory=list, max_length=100)
 
 
+class SemanticRecordResult(ApiModel):
+    record_index: int = Field(ge=0, le=99)
+    values: list[SemanticValue] = Field(default_factory=list, max_length=100)
+
+
+class SemanticBatchResult(ApiModel):
+    records: list[SemanticRecordResult] = Field(default_factory=list, max_length=100)
+
+
 class Evidence(ApiModel):
     method: ExtractorName
     detail: str = Field(min_length=1, max_length=1_000)
@@ -109,6 +118,9 @@ class ExtractedProperty(ApiModel):
 
 class CompiledFact(ApiModel):
     source: str
+    atom: str
+    strength: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
     proof_id: str
     idempotency_key: str
     property_name: str

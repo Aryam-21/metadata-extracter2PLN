@@ -28,6 +28,9 @@ def compile_fact(
     )
     return CompiledFact(
         source=source,
+        atom=body,
+        strength=extracted.strength,
+        confidence=extracted.confidence,
         proof_id=proof_id,
         idempotency_key=hashlib.sha256(source.encode("utf-8")).hexdigest(),
         property_name=predicate,
