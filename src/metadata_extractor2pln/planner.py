@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
+import logging
 from typing import Any, Iterable, Sequence
 
-from .backends import ModelBackend
+from .backends import BackendUnavailable, ModelBackend
 from .models import ExtractionPlan, PlanDraft, PropertySpec, Usage
 from .utils import get_path, normalize_name, schema_paths, stable_hash, text_from_value
 
@@ -12,6 +13,82 @@ ID_HINTS = ("id", "uuid", "slug", "url", "uri")
 TEXT_HINTS = ("content", "text", "body", "description", "summary", "article")
 DATE_HINTS = ("date", "time", "created", "published", "updated")
 IDENTITY_NAMES = {"id", "identifier", "slug", "url", "uri", "name", "title"}
+CONTENT_TAXONOMY = (
+    (
+        "audience-expertise",
+        "Expertise expected from the intended reader",
+        ["beginner", "intermediate", "advanced", "expert"],
+    ),
+    (
+        "topic",
+        "Dominant subject of the article",
+        [
+            "technology",
+            "science",
+            "business",
+            "politics",
+            "culture",
+            "society",
+            "health",
+            "environment",
+            "education",
+            "entertainment",
+            "philosophy",
+            "other",
+        ],
+    ),
+    (
+        "tone",
+        "Dominant communication tone",
+        [
+            "analytical",
+            "educational",
+            "conversational",
+            "persuasive",
+            "critical",
+            "inspirational",
+            "humorous",
+            "neutral",
+        ],
+    ),
+    (
+        "content-type",
+        "Editorial format of the article",
+        [
+            "news",
+            "analysis",
+            "opinion",
+            "tutorial",
+            "interview",
+            "review",
+            "research",
+            "announcement",
+            "narrative",
+            "other",
+        ],
+    ),
+    (
+        "primary-goal",
+        "Primary purpose of the article",
+        ["inform", "explain", "persuade", "teach", "entertain", "critique", "promote", "discuss"],
+    ),
+    (
+        "sentiment",
+        "Overall evaluative sentiment",
+        ["positive", "neutral", "negative", "mixed"],
+    ),
+    (
+        "complexity",
+        "Conceptual complexity of the subject matter",
+        ["low", "medium", "high"],
+    ),
+    (
+        "actionability",
+        "How directly a reader can act on the article",
+        ["low", "medium", "high"],
+    ),
+)
+logger = logging.getLogger(__name__)
 
 
 def discover_plan(
@@ -24,13 +101,22 @@ def discover_plan(
 ) -> tuple[ExtractionPlan, str | None, Usage]:
     required = _required_names(required_properties)
     if use_model and backend is not None and backend.ready:
-        draft, usage = backend.discover_plan(
-            source_name=source_name,
-            records=records,
-            required_properties=required,
-        )
-        planner = "gemini"
-        model = backend.name
+        try:
+            draft, usage = backend.discover_plan(
+                source_name=source_name,
+                records=records,
+                required_properties=required,
+            )
+            planner = backend.provider
+            model = backend.name
+        except BackendUnavailable as exc:
+            logger.warning(
+                "Model planning failed; using the deterministic planner: %s", exc
+            )
+            draft = heuristic_plan(records)
+            usage = Usage()
+            planner = "heuristic"
+            model = None
     else:
         draft = heuristic_plan(records)
         usage = Usage()
@@ -63,7 +149,7 @@ def heuristic_plan(records: Sequence[dict[str, Any]]) -> PlanDraft:
         properties.extend(
             [
                 PropertySpec(
-                    name="length",
+                    name="length-bucket",
                     description="Length of the main text",
                     extractor="calculated_metric",
                     field_paths=text_fields,
@@ -157,6 +243,8 @@ def sanitize_plan(
         name = normalize_name(raw.name)
         if name in IDENTITY_NAMES:
             continue
+        if raw.extractor == "semantic_text" and not raw.allowed_values:
+            continue
         paths = _valid_paths(raw.field_paths, available)
         if (
             raw.extractor in {"structured_field", "numeric_bucket", "date_bucket"}
@@ -165,6 +253,11 @@ def sanitize_plan(
             continue
         spec = raw.model_copy(update={"name": name, "field_paths": paths})
         by_name.setdefault(name, spec)
+
+    if texts:
+        by_name.update(
+            {spec.name: spec for spec in _canonical_content_specs(texts)}
+        )
 
     for required in _required_names(required_properties):
         by_name[required] = _required_spec(
@@ -224,8 +317,17 @@ def _required_spec(
             description="Engagement level calculated from available interaction metrics",
             extractor="calculated_metric",
             field_paths=paths,
-            allowed_values=["low", "medium", "high"],
+            allowed_values=["Low", "Medium", "High", "Very_High"],
             metric="engagement",
+            required=True,
+        )
+    if name == "audience-expertise":
+        return PropertySpec(
+            name=name,
+            description="Expertise expected from the intended reader",
+            extractor="semantic_text",
+            field_paths=text_fields,
+            allowed_values=["beginner", "intermediate", "advanced", "expert"],
             required=True,
         )
     if proposed is not None:
@@ -237,6 +339,38 @@ def _required_spec(
         field_paths=text_fields,
         required=True,
     )
+
+
+def _canonical_content_specs(text_fields: list[str]) -> list[PropertySpec]:
+    specs = [
+        PropertySpec(
+            name="length-bucket",
+            description="Length of the main article text",
+            extractor="calculated_metric",
+            field_paths=text_fields,
+            allowed_values=["short", "medium", "long"],
+            metric="length",
+        ),
+        PropertySpec(
+            name="reading-time",
+            description="Estimated time required to read the article",
+            extractor="calculated_metric",
+            field_paths=text_fields,
+            allowed_values=["quick", "medium", "long"],
+            metric="reading-time",
+        ),
+    ]
+    specs.extend(
+        PropertySpec(
+            name=name,
+            description=description,
+            extractor="semantic_text",
+            field_paths=text_fields,
+            allowed_values=allowed_values,
+        )
+        for name, description, allowed_values in CONTENT_TAXONOMY
+    )
+    return specs
 
 
 def _required_names(values: Iterable[str]) -> list[str]:

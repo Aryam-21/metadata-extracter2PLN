@@ -1,3 +1,4 @@
+from metadata_extractor2pln.backends import BackendUnavailable
 from metadata_extractor2pln.models import PlanDraft, PropertySpec
 from metadata_extractor2pln.planner import (
     discover_plan,
@@ -41,6 +42,17 @@ def test_heuristic_plan_discovers_paths_and_enforces_required_properties():
     assert specs["engagement"].required is True
     assert {"likes", "comments"}.issubset(specs["engagement"].field_paths)
     assert specs["audience-expertise"].extractor == "semantic_text"
+    assert {
+        "length-bucket",
+        "reading-time",
+        "topic",
+        "tone",
+        "content-type",
+        "primary-goal",
+        "sentiment",
+        "complexity",
+        "actionability",
+    }.issubset(specs)
 
 
 def test_sanitizer_replaces_unsafe_model_engagement_definition():
@@ -79,6 +91,32 @@ def test_sanitizer_replaces_unsafe_model_engagement_definition():
     assert plan.text_fields == ["body"]
 
 
+def test_sanitizer_drops_unbounded_optional_semantic_properties():
+    draft = PlanDraft(
+        id_fields=["article_id"],
+        text_fields=["body"],
+        properties=[
+            PropertySpec(
+                name="summary",
+                description="Free-form article summary",
+                extractor="semantic_text",
+                field_paths=["body"],
+            )
+        ],
+    )
+
+    plan = sanitize_plan(
+        source_name="articles",
+        draft=draft,
+        records=RECORDS,
+        required_properties=["engagement"],
+        planner="gemini",
+    )
+
+    assert "summary" not in {item.name for item in plan.properties}
+    assert "topic" in {item.name for item in plan.properties}
+
+
 def test_modified_plan_fingerprint_is_rejected():
     plan, _, _ = discover_plan(
         source_name="articles",
@@ -94,3 +132,24 @@ def test_modified_plan_fingerprint_is_rejected():
         assert "fingerprint" in str(exc)
     else:
         raise AssertionError("modified plan should have been rejected")
+
+
+def test_model_planning_failure_falls_back_to_deterministic_plan():
+    class FailingBackend:
+        name = "unavailable-model"
+        ready = True
+
+        def discover_plan(self, **kwargs):
+            raise BackendUnavailable("rate limited")
+
+    plan, model, usage = discover_plan(
+        source_name="articles",
+        records=RECORDS,
+        required_properties=["engagement"],
+        backend=FailingBackend(),
+        use_model=True,
+    )
+
+    assert plan.planner == "heuristic"
+    assert model is None
+    assert usage.input_tokens == 0
