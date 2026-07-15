@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import time
 import uuid
 from collections import defaultdict, deque
@@ -13,6 +14,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings, get_settings
+from .backends import BackendUnavailable
+from .asi import AsiBackend
 from .gemini import GeminiBackend
 from .models import (
     ExtractRequest,
@@ -28,6 +31,7 @@ from .service import MetadataService
 
 
 PUBLIC_PATHS = {"/health", "/ready"}
+logger = logging.getLogger(__name__)
 
 
 class BodySizeLimitMiddleware:
@@ -82,10 +86,19 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     settings.validate()
-    backend = GeminiBackend(
-        api_key=settings.gemini_api_key,
-        model=settings.gemini_model,
-        timeout_seconds=settings.model_timeout_seconds,
+    backend = (
+        AsiBackend(
+            api_key=settings.asi_api_key,
+            model=settings.asi_model,
+            base_url=settings.asi_base_url,
+            timeout_seconds=settings.model_timeout_seconds,
+        )
+        if settings.model_provider == "asi"
+        else GeminiBackend(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_model,
+            timeout_seconds=settings.model_timeout_seconds,
+        )
     )
     service = service or MetadataService(backend)
     app = FastAPI(
@@ -166,6 +179,19 @@ def create_app(
         return JSONResponse(
             status_code=422,
             content={"error": {"code": "invalid_contract", "message": str(exc)}},
+        )
+
+    @app.exception_handler(BackendUnavailable)
+    async def backend_unavailable(request: Request, exc: BackendUnavailable):
+        logger.exception("Model backend request failed", exc_info=exc)
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "code": "model_backend_unavailable",
+                    "message": "the configured model backend could not complete the request",
+                }
+            },
         )
 
     async def execute(function, request):

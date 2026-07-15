@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Protocol, Sequence
 
-from .models import PlanDraft, PropertySpec, SemanticResult, Usage
+from .models import PlanDraft, PropertySpec, SemanticBatchResult, Usage
 
 
 class ModelBackend(Protocol):
     name: str
+    provider: str
     ready: bool
 
     def discover_plan(
@@ -20,10 +21,9 @@ class ModelBackend(Protocol):
     def extract_semantics(
         self,
         *,
-        record: dict[str, Any],
-        text: str,
+        texts: Sequence[str],
         properties: Sequence[PropertySpec],
-    ) -> tuple[SemanticResult, Usage]: ...
+    ) -> tuple[SemanticBatchResult, Usage]: ...
 
 
 class BackendUnavailable(RuntimeError):

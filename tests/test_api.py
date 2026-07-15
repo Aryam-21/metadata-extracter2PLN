@@ -47,10 +47,12 @@ def test_offline_run_returns_deterministic_facts():
     body = response.json()
     assert body["plan"]["fingerprint"]
     assert len(body["extraction"]["records"]) == 2
-    assert any(
-        fact["property_name"] == "engagement"
+    engagement_fact = next(
+        fact
         for fact in body["extraction"]["records"][0]["facts"]
+        if fact["property_name"] == "engagement"
     )
+    assert engagement_fact["atom"].startswith("(engagement ")
 
 
 def test_body_size_limit_applies_before_validation():
