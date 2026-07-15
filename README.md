@@ -5,7 +5,7 @@ A headless, schema-adaptive metadata extraction service. It inspects JSON record
 The service does **not** execute MeTTa supplied by callers and does not write directly to a knowledge base. Its trust boundary ends at validated fact strings such as:
 
 ```metta
-(: news_abc123 (engagement news_article-42 "high") (STV 0.75 0.9))
+(: news_abc123 (engagement news_article-42 "High") (STV 0.75 0.9))
 ```
 
 ## What is implemented
@@ -13,12 +13,24 @@ The service does **not** execute MeTTa supplied by callers and does not write di
 - typed plan discovery with a deterministic fallback
 - mandatory-property enforcement after model planning
 - deterministic structured, numeric, date, length, reading-time, and engagement extraction
-- Gemini structured output for semantic properties
+- ASI:One or Gemini structured output for semantic properties, batched across each extraction request
 - allowed-value and source-evidence validation
 - PeTTaChainer-compatible fact compilation with idempotency keys
 - authenticated bulk HTTP endpoints with request, concurrency, timeout, and rate limits
 
 The first release accepts bounded inline JSON batches. Durable jobs, source connectors, plan storage, and delivery to downstream PeTTaChainer servers are deliberately left outside this initial trust boundary.
+
+Engagement is calculated from weighted interactions: comments count twice,
+shares count three times, and other reactions count once. When views are
+available the service classifies the resulting engagement rate; otherwise it
+classifies the weighted interaction count. Compiled facts expose both the complete PeTTaChainer
+statement and its validated `atom`/truth-value fields for downstream adapters.
+
+Plan discovery sends only bounded samples to the configured model. If it is unavailable or
+returns output that fails the service contract, discovery falls back to the
+deterministic planner. Semantic properties for all records in one `/v1/extract`
+request are classified in one model request; each source text is capped at
+12,000 characters before it crosses the model boundary.
 
 ## Run locally
 
@@ -26,13 +38,25 @@ Python 3.11 or newer and `uv` are recommended.
 
 ```bash
 cp .env.example .env
-# Edit .env and set a long API secret and GEMINI_API_KEY.
+# Edit .env, set a long API secret, choose a model provider, and set its key.
 uv sync --extra dev
 set -a; source .env; set +a
 uv run uvicorn metadata_extractor2pln.api:app --host 127.0.0.1 --port 8080
 ```
 
-`METADATA_API_KEYS` is a comma-separated list so that multiple clients can be rotated independently. Each entry is `owner-id:secret`; callers send the whole entry as the bearer token. It is unrelated to Gemini authentication.
+`METADATA_API_KEYS` is a comma-separated list so that multiple clients can be rotated independently. Each entry is `owner-id:secret`; callers send the whole entry as the bearer token. It is unrelated to model-provider authentication.
+
+Use ASI:One for the ingestion model with:
+
+```dotenv
+METADATA_MODEL_PROVIDER=asi
+ASI_ONE_API_KEY=replace-with-an-asi-one-key
+METADATA_ASI_MODEL=asi1-mini
+```
+
+Use `METADATA_MODEL_PROVIDER=gemini` with `GEMINI_API_KEY` instead when Gemini
+is preferred. Provider selection is explicit; the service does not silently
+route between providers.
 
 ```bash
 curl -s http://127.0.0.1:8080/health
