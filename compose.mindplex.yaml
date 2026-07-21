@@ -1,0 +1,11 @@
+services:
+  api:
+    networks:
+      reasoning-tools:
+        aliases:
+          - metadata-extractor
+
+networks:
+  reasoning-tools:
+    name: mindplex-reasoning-tools
+    external: true

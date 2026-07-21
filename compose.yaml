@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${METADATA_EXTRACTOR_PORT:-8082}:8080"
     read_only: true
     tmpfs:
       - /tmp:size=32m,noexec,nosuid
