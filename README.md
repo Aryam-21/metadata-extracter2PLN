@@ -1,6 +1,6 @@
 # metadata-extractor2PLN
 
-A headless, schema-adaptive metadata extraction service. It inspects JSON records, builds a typed extraction plan, applies deterministic and Gemini-backed extractors, records evidence, and compiles accepted values into facts understood by PeTTaChainer.
+A headless, schema-adaptive metadata extraction service. It inspects JSON records, builds a typed extraction plan, applies deterministic and model-backed extractors, records evidence, and compiles accepted values into facts understood by PeTTaChainer.
 
 The service does **not** execute MeTTa supplied by callers and does not write directly to a knowledge base. Its trust boundary ends at validated fact strings such as:
 
@@ -13,7 +13,7 @@ The service does **not** execute MeTTa supplied by callers and does not write di
 - typed plan discovery with a deterministic fallback
 - mandatory-property enforcement after model planning
 - deterministic structured, numeric, date, length, reading-time, and engagement extraction
-- ASI:One or Gemini structured output for semantic properties, batched across each extraction request
+- Bedrock schema-constrained output for semantic properties, batched across each extraction request
 - allowed-value and source-evidence validation
 - PeTTaChainer-compatible fact compilation with idempotency keys
 - authenticated bulk HTTP endpoints with request, concurrency, timeout, and rate limits
@@ -44,25 +44,21 @@ set -a; source .env; set +a
 uv run uvicorn metadata_extractor2pln.api:app --host 127.0.0.1 --port 8080
 ```
 
-`METADATA_API_KEYS` is a comma-separated list so that multiple clients can be rotated independently. Each entry is `owner-id:secret`; callers send the whole entry as the bearer token. It is unrelated to model-provider authentication.
+`METADATA_API_KEYS` is a comma-separated list so multiple clients can be rotated independently. Each entry is `owner-id:secret`; callers send only the secret as the bearer token. It is unrelated to model-provider authentication.
 
-Use ASI:One for the ingestion model with:
+Bedrock is the default provider. Choose a model that supports Bedrock structured
+outputs, such as DeepSeek V3.2:
 
 ```dotenv
-METADATA_MODEL_PROVIDER=asi
-ASI_ONE_API_KEY=replace-with-an-asi-one-key
-METADATA_ASI_MODEL=asi1-mini
+METADATA_BEDROCK_MODEL_ID=deepseek.v3.2
+AWS_REGION=us-east-1
 ```
-
-Use `METADATA_MODEL_PROVIDER=gemini` with `GEMINI_API_KEY` instead when Gemini
-is preferred. Provider selection is explicit; the service does not silently
-route between providers.
 
 ```bash
 curl -s http://127.0.0.1:8080/health
 
 curl -s http://127.0.0.1:8080/v1/run \
-  -H 'Authorization: Bearer local:replace-with-at-least-32-random-characters' \
+  -H 'Authorization: Bearer replace-with-at-least-32-random-characters' \
   -H 'Content-Type: application/json' \
   -d '{
     "namespace": "demo",
@@ -76,7 +72,7 @@ curl -s http://127.0.0.1:8080/v1/run \
   }'
 ```
 
-For a completely offline smoke test, set `"use_model": false` and `"required_properties": ["engagement"]`. The normal defaults also require `audience-expertise`, which intentionally reports an extraction error when no model backend is configured.
+For a completely offline smoke test, set `"use_model": false` and `"required_properties": ["engagement"]`. Omit `required_properties` to let plan discovery choose properties from the supplied records; provide it only when specific properties must be present.
 
 ## API
 
