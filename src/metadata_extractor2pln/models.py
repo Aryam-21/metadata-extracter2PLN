@@ -143,7 +143,7 @@ class PlanRequest(ApiModel):
     source_name: str = Field(default="json", pattern=SOURCE_PATTERN)
     records: list[dict[str, Any]] = Field(min_length=1, max_length=20)
     required_properties: list[str] = Field(
-        default_factory=lambda: ["engagement", "audience-expertise"],
+        default_factory=list,
         max_length=20,
     )
     use_model: bool = True

@@ -1,10 +1,16 @@
 from metadata_extractor2pln.backends import BackendUnavailable
-from metadata_extractor2pln.models import PlanDraft, PropertySpec
+from metadata_extractor2pln.models import PlanDraft, PlanRequest, PropertySpec
 from metadata_extractor2pln.planner import (
     discover_plan,
     sanitize_plan,
     validate_and_pin_plan,
 )
+
+
+def test_plan_request_does_not_force_properties_when_the_caller_omits_them():
+    request = PlanRequest(records=[{"id": "article-1", "content": "A technical article."}])
+
+    assert request.required_properties == []
 
 
 RECORDS = [
