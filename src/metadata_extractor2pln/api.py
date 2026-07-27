@@ -248,8 +248,9 @@ def _authenticate(token: str | None, configured: tuple[str, ...]) -> str | None:
     if token is None:
         return None
     for entry in configured:
-        if hmac.compare_digest(token, entry):
-            return entry.partition(":")[0]
+        owner, _separator, secret = entry.partition(":")
+        if hmac.compare_digest(token, secret):
+            return owner
     return None
 
 

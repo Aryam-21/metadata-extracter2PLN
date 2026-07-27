@@ -39,7 +39,7 @@ def test_offline_run_returns_deterministic_facts():
     with _client() as client:
         response = client.post(
             "/v1/run",
-            headers={"Authorization": "Bearer tester:secret"},
+            headers={"Authorization": "Bearer secret"},
             json=payload,
         )
 
@@ -65,7 +65,7 @@ def test_body_size_limit_applies_before_validation():
     with TestClient(create_app(settings)) as client:
         response = client.post(
             "/v1/run",
-            headers={"Authorization": "Bearer tester:secret"},
+            headers={"Authorization": "Bearer secret"},
             content=b"x" * 21,
         )
     assert response.status_code == 413
@@ -81,7 +81,7 @@ def test_body_size_limit_cannot_be_bypassed_with_chunked_input():
     with TestClient(create_app(settings)) as client:
         response = client.post(
             "/v1/run",
-            headers={"Authorization": "Bearer tester:secret"},
+            headers={"Authorization": "Bearer secret"},
             content=iter([b"123456", b"789012"]),
         )
     assert response.status_code == 413
