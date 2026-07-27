@@ -80,7 +80,7 @@ def test_sanitizer_replaces_unsafe_model_engagement_definition():
         draft=draft,
         records=RECORDS,
         required_properties=["engagement"],
-        planner="gemini",
+        planner="bedrock",
     )
 
     engagement = next(item for item in plan.properties if item.name == "engagement")
@@ -110,7 +110,7 @@ def test_sanitizer_drops_unbounded_optional_semantic_properties():
         draft=draft,
         records=RECORDS,
         required_properties=["engagement"],
-        planner="gemini",
+        planner="bedrock",
     )
 
     assert "summary" not in {item.name for item in plan.properties}

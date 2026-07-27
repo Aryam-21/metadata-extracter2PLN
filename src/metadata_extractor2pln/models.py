@@ -63,7 +63,7 @@ class ExtractionPlan(ApiModel):
     text_fields: list[str] = Field(default_factory=list, max_length=32)
     properties: list[PropertySpec] = Field(min_length=1, max_length=100)
     version: int = Field(default=1, ge=1)
-    planner: Literal["heuristic", "gemini", "asi", "pinned"] = "heuristic"
+    planner: Literal["heuristic", "bedrock", "pinned"] = "heuristic"
     fingerprint: str = Field(default="", pattern=r"^$|^[a-f0-9]{64}$")
 
     @model_validator(mode="after")

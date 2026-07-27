@@ -15,8 +15,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings, get_settings
 from .backends import BackendUnavailable
-from .asi import AsiBackend
-from .gemini import GeminiBackend
+from .bedrock import BedrockBackend
 from .models import (
     ExtractRequest,
     ExtractResponse,
@@ -86,19 +85,13 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     settings.validate()
-    backend = (
-        AsiBackend(
-            api_key=settings.asi_api_key,
-            model=settings.asi_model,
-            base_url=settings.asi_base_url,
-            timeout_seconds=settings.model_timeout_seconds,
-        )
-        if settings.model_provider == "asi"
-        else GeminiBackend(
-            api_key=settings.gemini_api_key,
-            model=settings.gemini_model,
-            timeout_seconds=settings.model_timeout_seconds,
-        )
+    backend = BedrockBackend(
+        model=settings.bedrock_model,
+        region=settings.bedrock_region,
+        access_key=settings.bedrock_access_key,
+        secret_key=settings.bedrock_secret_key,
+        timeout_seconds=settings.model_timeout_seconds,
+        max_tokens=settings.bedrock_max_tokens,
     )
     service = service or MetadataService(backend)
     app = FastAPI(

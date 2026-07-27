@@ -25,12 +25,11 @@ class Settings:
     environment: str = "production"
     api_keys: tuple[str, ...] = ()
     allowed_hosts: tuple[str, ...] = ("localhost", "127.0.0.1")
-    model_provider: str = "gemini"
-    gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"
-    asi_api_key: str | None = None
-    asi_model: str = "asi1-mini"
-    asi_base_url: str = "https://api.asi1.ai/v1"
+    bedrock_model: str = ""
+    bedrock_region: str = "us-east-1"
+    bedrock_access_key: str | None = None
+    bedrock_secret_key: str | None = None
+    bedrock_max_tokens: int = 8192
     model_timeout_seconds: float = 45.0
     request_timeout_seconds: float = 120.0
     max_request_bytes: int = 2_097_152
@@ -44,12 +43,11 @@ class Settings:
             environment=os.getenv("METADATA_ENVIRONMENT", "production"),
             api_keys=_csv("METADATA_API_KEYS"),
             allowed_hosts=_csv("METADATA_ALLOWED_HOSTS", "localhost,127.0.0.1"),
-            model_provider=os.getenv("METADATA_MODEL_PROVIDER", "gemini").strip().lower(),
-            gemini_api_key=os.getenv("GEMINI_API_KEY") or None,
-            gemini_model=os.getenv("METADATA_GEMINI_MODEL", "gemini-2.5-flash"),
-            asi_api_key=os.getenv("ASI_ONE_API_KEY") or None,
-            asi_model=os.getenv("METADATA_ASI_MODEL", "asi1-mini"),
-            asi_base_url=os.getenv("METADATA_ASI_BASE_URL", "https://api.asi1.ai/v1"),
+            bedrock_model=os.getenv("METADATA_BEDROCK_MODEL_ID", "").strip(),
+            bedrock_region=os.getenv("AWS_REGION", "us-east-1").strip(),
+            bedrock_access_key=os.getenv("AWS_BEDROCK_ACCESS_KEY") or None,
+            bedrock_secret_key=os.getenv("AWS_BEDROCK_SECRET_KEY") or None,
+            bedrock_max_tokens=int(os.getenv("METADATA_BEDROCK_MAX_TOKENS", "8192")),
             model_timeout_seconds=float(
                 os.getenv("METADATA_MODEL_TIMEOUT_SECONDS", "45")
             ),
@@ -79,8 +77,10 @@ class Settings:
                 raise ValueError("API key secrets must contain at least 32 characters")
         if not self.allowed_hosts:
             raise ValueError("METADATA_ALLOWED_HOSTS cannot be empty")
-        if self.model_provider not in {"gemini", "asi"}:
-            raise ValueError("METADATA_MODEL_PROVIDER must be gemini or asi")
+        if self.environment != "test" and not self.bedrock_model:
+            raise ValueError("METADATA_BEDROCK_MODEL_ID is required for Bedrock")
+        if bool(self.bedrock_access_key) != bool(self.bedrock_secret_key):
+            raise ValueError("AWS_BEDROCK_ACCESS_KEY and AWS_BEDROCK_SECRET_KEY must be set together")
         if self.max_concurrent_requests < 1 or self.rate_limit_per_minute < 1:
             raise ValueError("concurrency and rate limits must be positive")
 
