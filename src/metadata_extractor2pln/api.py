@@ -14,6 +14,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings, get_settings
+from .jev_backend import JEVBackend
 from .backends import BackendUnavailable
 from .bedrock import BedrockBackend
 from .models import (
@@ -85,14 +86,24 @@ def create_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     settings.validate()
-    backend = BedrockBackend(
-        model=settings.bedrock_model,
-        region=settings.bedrock_region,
-        access_key=settings.bedrock_access_key,
-        secret_key=settings.bedrock_secret_key,
-        timeout_seconds=settings.model_timeout_seconds,
-        max_tokens=settings.bedrock_max_tokens,
-    )
+    if settings.model_provider == "jev":
+        backend = JEVBackend(
+            model=settings.jev_model,
+            api_key=settings.jev_api_key,
+            timeout_seconds=settings.model_timeout_seconds,
+            transport=settings.jev_transport,
+            openrouter_api_key=settings.openrouter_api_key,
+            openrouter_model=settings.openrouter_model,
+        )
+    else:
+        backend = BedrockBackend(
+            model=settings.bedrock_model,
+            region=settings.bedrock_region,
+            access_key=settings.bedrock_access_key,
+            secret_key=settings.bedrock_secret_key,
+            timeout_seconds=settings.model_timeout_seconds,
+            max_tokens=settings.bedrock_max_tokens,
+        )
     service = service or MetadataService(backend)
     app = FastAPI(
         title="metadata-extractor2PLN",
