@@ -14,6 +14,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings, get_settings
+from .request_context import set_request_deadline, reset_request_deadline
 from .jev_backend import JEVBackend
 from .backends import BackendUnavailable
 from .bedrock import BedrockBackend
@@ -199,22 +200,39 @@ def create_app(
         )
 
     async def execute(function, request):
-        async with semaphore:
+        await semaphore.acquire()
+
+        deadline = time.monotonic() + settings.request_timeout_seconds
+
+        def run():
+            token = set_request_deadline(deadline)
             try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(function, request),
-                    timeout=settings.request_timeout_seconds,
-                )
-            except TimeoutError:
-                return JSONResponse(
-                    status_code=504,
-                    content={
-                        "error": {
-                            "code": "request_timeout",
-                            "message": "processing exceeded its time limit",
-                        }
-                    },
-                )
+                return function(request)
+            finally:
+                reset_request_deadline(token)
+
+        task = asyncio.create_task(asyncio.to_thread(run))
+
+        def release_semaphore(_task):
+            semaphore.release()
+
+        task.add_done_callback(release_semaphore)
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=settings.request_timeout_seconds,
+            )
+        except TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "error": {
+                        "code": "request_timeout",
+                        "message": "processing exceeded its time limit",
+                    }
+                },
+            )
 
     @app.get("/health")
     async def health():
