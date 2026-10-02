@@ -85,3 +85,34 @@ def test_body_size_limit_cannot_be_bypassed_with_chunked_input():
             content=iter([b"123456", b"789012"]),
         )
     assert response.status_code == 413
+def test_jev_rejects_custom_semantic_property_without_allowed_values():
+    settings = Settings(
+        environment="test",
+        model_provider="jev",
+        jev_api_key="test-key",
+        api_keys=("tester:secret",),
+        allowed_hosts=("testserver",),
+        rate_limit_per_minute=20,
+    )
+
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/v1/run",
+            headers={"Authorization": "Bearer secret"},
+            json={
+                "namespace": "demo",
+                "source_name": "articles",
+                "use_model": False,
+                "required_properties": ["stance"],
+                "records": [
+                    {
+                        "id": "one",
+                        "content": "A short article about the policy.",
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 422
+    assert "allowed_values" in response.text
+    assert "stance" in response.text
