@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Sequence
-
 import httpx
+import logging
+import time
+from typing import Any, Sequence
 from typesafe_sdk import Choice, TypeSafeClient
 
+from .request_context import get_request_deadline
 from .backends import BackendUnavailable
 from .models import (
     PropertySpec,
@@ -14,6 +16,7 @@ from .models import (
     Usage,
 )
 from .structured_backend import StructuredBackend
+logger = logging.getLogger(__name__)
 
 
 class JEVBackend(StructuredBackend):
@@ -111,6 +114,12 @@ class JEVBackend(StructuredBackend):
         total_output_tokens = 0
 
         for record_index, text in enumerate(texts):
+            deadline = get_request_deadline()
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= self.timeout_seconds:
+                    break
             questions = self._build_questions(properties)
 
             try:
@@ -120,9 +129,12 @@ class JEVBackend(StructuredBackend):
                     model=self.model,
                 )
             except Exception as exc:
-                raise BackendUnavailable(
-                    f"JEV classification failed: {exc}"
-                ) from exc
+                logger.warning(
+                    "JEV classification failed for record %s: %s",
+                    record_index,
+                    exc,
+                )
+                continue
 
             values = self._convert_answers(
                 properties=properties,
@@ -167,6 +179,12 @@ class JEVBackend(StructuredBackend):
 
         with httpx.Client(timeout=self.timeout_seconds) as client:
             for record_index, text in enumerate(texts):
+                deadline = get_request_deadline()
+
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= self.timeout_seconds:
+                        break
                 questions = self._build_openrouter_questions(properties)
 
                 payload = {
@@ -184,9 +202,12 @@ class JEVBackend(StructuredBackend):
                     response.raise_for_status()
                     result = response.json()
                 except Exception as exc:
-                    raise BackendUnavailable(
-                        f"OpenRouter JEV classification failed: {exc}"
-                    ) from exc
+                    logger.warning(
+                        "OpenRouter JEV classification failed for record %s: %s",
+                        record_index,
+                        exc,
+                    )
+                    continue
 
                 answers = result.get("answers")
                 if not isinstance(answers, dict):
