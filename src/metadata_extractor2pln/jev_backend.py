@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import httpx
+import asyncio
 import logging
 import time
 from typing import Any, Sequence
-from typesafe_sdk import Choice, TypeSafeClient
 
-from .request_context import get_request_deadline
+import httpx
+from typesafe_sdk import AsyncTypeSafeClient, Choice, RetryPolicy
+
 from .backends import BackendUnavailable
 from .models import (
     PropertySpec,
@@ -15,7 +16,14 @@ from .models import (
     SemanticValue,
     Usage,
 )
+from .request_context import (
+    get_request_deadline,
+    request_cancelled,
+    watch_request_cancellation,
+)
 from .structured_backend import StructuredBackend
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,8 +52,6 @@ class JEVBackend(StructuredBackend):
         self.openrouter_model = openrouter_model
         self.openrouter_base_url = openrouter_base_url
 
-        self._client: TypeSafeClient | None = None
-
     @property
     def ready(self) -> bool:
         if self.transport == "openrouter":
@@ -59,9 +65,7 @@ class JEVBackend(StructuredBackend):
         records: Sequence[dict[str, Any]],
         required_properties: Sequence[str],
     ) -> tuple[Any, Usage]:
-        raise BackendUnavailable(
-            "JEV is configured for semantic classification only"
-        )
+        raise BackendUnavailable("JEV is configured for semantic classification only")
 
     def extract_semantics(
         self,
@@ -70,192 +74,132 @@ class JEVBackend(StructuredBackend):
         properties: Sequence[PropertySpec],
     ) -> tuple[SemanticBatchResult, Usage]:
         if not self.ready:
-            if self.transport == "openrouter":
-                raise BackendUnavailable(
-                    "JEV OpenRouter transport is not configured; "
-                    "set OPENROUTER_API_KEY"
-                )
-
-            raise BackendUnavailable(
-                "JEV is not configured; set TYPESAFE_API_KEY"
-            )
-
+            key = "OPENROUTER_API_KEY" if self.transport == "openrouter" else "TYPESAFE_API_KEY"
+            raise BackendUnavailable(f"JEV is not configured; set {key}")
         if not properties:
             return SemanticBatchResult(records=[]), Usage()
-
         for prop in properties:
             if not prop.allowed_values:
                 raise ValueError(
-                    f"JEV classification requires allowed_values "
-                    f"for property {prop.name!r}"
+                    f"JEV classification requires allowed_values for property {prop.name!r}"
                 )
 
+        # The service calls synchronous backends in a worker thread. Each batch
+        # owns its event loop and clients so cancellation closes in-flight I/O.
+        return asyncio.run(self._extract_batch(texts, properties))
+
+    async def _extract_batch(
+        self,
+        texts: Sequence[str],
+        properties: Sequence[PropertySpec],
+    ) -> tuple[SemanticBatchResult, Usage]:
         if self.transport == "openrouter":
-            return self._extract_with_openrouter(
-                texts=texts,
-                properties=properties,
+            client = httpx.AsyncClient(timeout=self.timeout_seconds)
+        else:
+            client = AsyncTypeSafeClient(
+                api_key=self.api_key,
+                timeout=self.timeout_seconds,
+                retry=RetryPolicy(max_retries=0),
             )
-
-        return self._extract_with_typesafe(
-            texts=texts,
-            properties=properties,
-        )
-
-    def _extract_with_typesafe(
-        self,
-        *,
-        texts: Sequence[str],
-        properties: Sequence[PropertySpec],
-    ) -> tuple[SemanticBatchResult, Usage]:
-        client = self._get_client()
 
         records: list[SemanticRecordResult] = []
-        total_input_tokens = 0
-        total_output_tokens = 0
-
-        for record_index, text in enumerate(texts):
-            deadline = get_request_deadline()
-
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= self.timeout_seconds:
-                    break
-            questions = self._build_questions(properties)
-
-            try:
-                result = client.system_one(
-                    state=text[:12000],
-                    questions=questions,
-                    model=self.model,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "JEV classification failed for record %s: %s",
-                    record_index,
-                    exc,
-                )
-                continue
-
-            values = self._convert_answers(
-                properties=properties,
-                answers=result.answers,
-            )
-
-            records.append(
-                SemanticRecordResult(
-                    record_index=record_index,
-                    values=values,
-                )
-            )
-
-            if result.usage.input_tokens is not None:
-                total_input_tokens += result.usage.input_tokens
-
-            if result.usage.output_tokens is not None:
-                total_output_tokens += result.usage.output_tokens
-
-        return (
-            SemanticBatchResult(records=records),
-            Usage(
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-            ),
-        )
-
-    def _extract_with_openrouter(
-        self,
-        *,
-        texts: Sequence[str],
-        properties: Sequence[PropertySpec],
-    ) -> tuple[SemanticBatchResult, Usage]:
-        records: list[SemanticRecordResult] = []
-        total_input_tokens = 0
-        total_output_tokens = 0
-
-        headers = {
-            "Authorization": f"Bearer {self.openrouter_api_key}",
-            "Content-Type": "application/json",
-        }
-
-        with httpx.Client(timeout=self.timeout_seconds) as client:
+        total_usage = Usage()
+        deadline = get_request_deadline()
+        async with client:
             for record_index, text in enumerate(texts):
-                deadline = get_request_deadline()
-
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= self.timeout_seconds:
-                        break
-                questions = self._build_openrouter_questions(properties)
-
-                payload = {
-                    "model": self.openrouter_model,
-                    "state": text[:12000],
-                    "questions": questions,
-                }
-
-                try:
-                    response = client.post(
-                        self.openrouter_base_url,
-                        headers=headers,
-                        json=payload,
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if request_cancelled() or (remaining is not None and remaining <= 0):
+                    records.extend(
+                        SemanticRecordResult(
+                            record_index=index,
+                            errors=["semantic extraction stopped at the request deadline or cancellation"],
+                        )
+                        for index in range(record_index, len(texts))
                     )
-                    response.raise_for_status()
-                    result = response.json()
+                    break
+
+                timeout = self.timeout_seconds
+                if remaining is not None:
+                    timeout = min(timeout, remaining)
+                try:
+                    # Unlike HTTP phase timeouts, this bounds the entire call,
+                    # including a response that arrives slowly in many chunks.
+                    async with asyncio.timeout(timeout):
+                        call = asyncio.create_task(self._classify(client, text, properties))
+                        with watch_request_cancellation(call):
+                            try:
+                                answers, usage = await call
+                            except asyncio.CancelledError:
+                                if not request_cancelled():
+                                    raise
+                                raise BackendUnavailable("JEV request was cancelled") from None
+                    total_usage.input_tokens += usage.input_tokens
+                    total_usage.output_tokens += usage.output_tokens
+                    values = self._convert_answers(properties=properties, answers=answers)
+                    record = SemanticRecordResult(record_index=record_index, values=values)
                 except Exception as exc:
                     logger.warning(
-                        "OpenRouter JEV classification failed for record %s: %s",
+                        "JEV classification failed for record %s: %s",
                         record_index,
-                        exc,
+                        type(exc).__name__,
                     )
-                    continue
-
-                answers = result.get("answers")
-                if not isinstance(answers, dict):
-                    raise BackendUnavailable(
-                        "OpenRouter JEV response did not contain "
-                        "a valid 'answers' object"
+                    message = (
+                        "semantic classification exceeded its time limit"
+                        if isinstance(exc, TimeoutError)
+                        else "semantic classification failed because the model request or response was invalid"
                     )
+                    record = SemanticRecordResult(record_index=record_index, errors=[message])
+                records.append(record)
 
-                values = self._convert_answers(
-                    properties=properties,
-                    answers=answers,
-                )
+        return SemanticBatchResult(records=records), total_usage
 
-                records.append(
-                    SemanticRecordResult(
-                        record_index=record_index,
-                        values=values,
-                    )
-                )
+    async def _classify(
+        self,
+        client: Any,
+        text: str,
+        properties: Sequence[PropertySpec],
+    ) -> tuple[dict[str, Any], Usage]:
+        if self.transport != "openrouter":
+            result = await client.system_one(
+                state=text[:12000],
+                questions=self._build_questions(properties),
+                model=self.model,
+            )
+            return result.answers, Usage(
+                input_tokens=result.usage.input_tokens or 0,
+                output_tokens=result.usage.output_tokens or 0,
+            )
 
-                usage = result.get("usage", {})
-
-                if isinstance(usage, dict):
-                    input_tokens = usage.get("input_tokens", 0) or 0
-                    output_tokens = usage.get("output_tokens", 0) or 0
-
-                    total_input_tokens += int(input_tokens)
-                    total_output_tokens += int(output_tokens)
-
-        return (
-            SemanticBatchResult(records=records),
-            Usage(
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-            ),
+        response = await client.post(
+            self.openrouter_base_url,
+            headers={
+                "Authorization": f"Bearer {self.openrouter_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.openrouter_model,
+                "state": text[:12000],
+                "questions": self._build_openrouter_questions(properties),
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or not isinstance(result.get("answers"), dict):
+            raise BackendUnavailable("OpenRouter JEV response did not contain a valid answers object")
+        usage = result.get("usage") or {}
+        if not isinstance(usage, dict):
+            raise BackendUnavailable("OpenRouter JEV response contained invalid usage")
+        return result["answers"], Usage(
+            input_tokens=int(usage.get("input_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or 0),
         )
 
     @staticmethod
-    def _build_questions(
-        properties: Sequence[PropertySpec],
-    ) -> dict[str, Choice]:
+    def _build_questions(properties: Sequence[PropertySpec]) -> dict[str, Choice]:
         return {
             prop.name: Choice(
                 instructions=prop.description,
-                criteria={
-                    value: None
-                    for value in prop.allowed_values
-                },
+                criteria={value: None for value in prop.allowed_values},
             )
             for prop in properties
         }
@@ -268,10 +212,7 @@ class JEVBackend(StructuredBackend):
             prop.name: {
                 "type": "choice",
                 "instructions": prop.description,
-                "criteria": {
-                    value: None
-                    for value in prop.allowed_values
-                },
+                "criteria": {value: None for value in prop.allowed_values},
             }
             for prop in properties
         }
@@ -282,17 +223,13 @@ class JEVBackend(StructuredBackend):
         properties: Sequence[PropertySpec],
         answers: dict[str, Any],
     ) -> list[SemanticValue]:
+        if not isinstance(answers, dict):
+            raise BackendUnavailable("JEV returned an invalid answers object")
         values: list[SemanticValue] = []
-
         for prop in properties:
             answer = answers.get(prop.name)
-
             if answer is None:
-                raise BackendUnavailable(
-                    f"JEV response is missing answer for "
-                    f"property {prop.name!r}"
-                )
-
+                raise BackendUnavailable(f"JEV response is missing answer for property {prop.name!r}")
             if isinstance(answer, dict):
                 choice = answer.get("choice")
                 confidence = answer.get("confidence", 0.0)
@@ -301,41 +238,18 @@ class JEVBackend(StructuredBackend):
                 choice = answer.choice
                 confidence = answer.confidence
                 probabilities = answer.probabilities
-
-            if not isinstance(choice, str):
-                raise BackendUnavailable(
-                    f"JEV returned an invalid choice for "
-                    f"property {prop.name!r}"
-                )
-
-            strength = probabilities.get(choice, 0.0)
-
+            if not isinstance(choice, str) or not isinstance(probabilities, dict):
+                raise BackendUnavailable(f"JEV returned an invalid choice for property {prop.name!r}")
             values.append(
                 SemanticValue(
                     property_name=prop.name,
                     value=choice,
-                    strength=float(strength),
+                    strength=float(probabilities.get(choice, 0.0)),
                     confidence=float(confidence),
                     evidence_quote=None,
                 )
             )
-
         return values
 
-    def _get_client(self) -> TypeSafeClient:
-        if self._client is None:
-            self._client = TypeSafeClient(
-                api_key=self.api_key,
-                timeout=self.timeout_seconds,
-            )
-
-        return self._client
-
-    def _request(
-        self,
-        prompt: str,
-        schema: type,
-    ) -> tuple[Any, Usage]:
-        raise BackendUnavailable(
-            "JEV does not support generic structured generation"
-        )
+    def _request(self, prompt: str, schema: type) -> tuple[Any, Usage]:
+        raise BackendUnavailable("JEV does not support generic structured generation")

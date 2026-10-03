@@ -14,7 +14,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings, get_settings
-from .request_context import set_request_deadline, reset_request_deadline
+from .request_context import (
+    RequestCancellation,
+    reset_request_cancelled,
+    reset_request_deadline,
+    set_request_cancelled,
+    set_request_deadline,
+)
 from .jev_backend import JEVBackend
 from .backends import BackendUnavailable
 from .bedrock import BedrockBackend
@@ -200,30 +206,39 @@ def create_app(
         )
 
     async def execute(function, request):
-        await semaphore.acquire()
-
         deadline = time.monotonic() + settings.request_timeout_seconds
+        cancelled = RequestCancellation()
 
         def run():
-            token = set_request_deadline(deadline)
+            deadline_token = set_request_deadline(deadline)
+            cancelled_token = set_request_cancelled(cancelled)
             try:
                 return function(request)
             finally:
-                reset_request_deadline(token)
+                reset_request_cancelled(cancelled_token)
+                reset_request_deadline(deadline_token)
 
-        task = asyncio.create_task(asyncio.to_thread(run))
-
-        def release_semaphore(_task):
+        def worker_done(task):
             semaphore.release()
-
-        task.add_done_callback(release_semaphore)
+            # Observe exceptions even if the request stopped awaiting this worker.
+            if not task.cancelled():
+                task.exception()
 
         try:
-            return await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=settings.request_timeout_seconds,
-            )
+            async with asyncio.timeout(settings.request_timeout_seconds):
+                await semaphore.acquire()
+                try:
+                    task = asyncio.create_task(asyncio.to_thread(run))
+                except BaseException:
+                    semaphore.release()
+                    raise
+                task.add_done_callback(worker_done)
+                return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         except TimeoutError:
+            cancelled.set()
             return JSONResponse(
                 status_code=504,
                 content={
